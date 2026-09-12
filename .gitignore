@@ -1,0 +1,7 @@
+@"
+.venv/
+__pycache__/
+browser/profile/
+output/
+*.pyc
+"@ | Out-File -Encoding utf8 .gitignore
