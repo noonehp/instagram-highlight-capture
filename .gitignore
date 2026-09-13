@@ -9,6 +9,10 @@ browser/
 output/
 downloads/
 
+# Personal input lists (-i files) -- these are your own working data,
+# not part of the project code
+*.txt
+
 # Editor / OS junk
 .vscode/
 .idea/
