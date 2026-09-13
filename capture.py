@@ -1,45 +1,58 @@
 #!/usr/bin/env python3
-
 """
-Instagram Highlight Screenshot Automator
+Instagram Highlight Downloader - V3
+
+Extension-only version.
+
+Behavior:
+    1. Open each Instagram Highlight URL.
+    2. Wait for Turbo Downloader's Story controls.
+    3. Prefer "Download all stories".
+    4. ONLY if "Download all stories" does not exist, click
+       "Download current story".
+    5. Do not capture Instagram media directly -- Turbo does the work,
+       this script just detects when files land and files them away.
+    6. Every URL gets its OWN subfolder under ./output/.
 
 Usage:
-    python capture.py "https://www.instagram.com/stories/highlights/18024150727811997/"
+    python capture.py "URL"
+    python capture.py -h "URL"
+    python capture.py "URL" -i inp.txt
+    python capture.py -i inp.txt
 
-What it does:
-    1. Opens a persistent Chromium profile.
-    2. Lets the user log into Instagram manually on first run.
-    3. Automatically clicks "View story" when Instagram shows it.
-    4. Opens the supplied Highlight URL.
-    5. Takes a screenshot of each Story.
-    6. Finds/clicks the Next button using several strategies.
-    7. Waits for the Story to actually change.
-    8. Prevents duplicate screenshots using SHA-256 hashes.
-    9. Detects loops/end-of-highlight.
-    10. Saves metadata and debug screenshots.
+inp.txt: one Instagram URL per line. Blank lines and lines starting
+with # are ignored.
 
-This tool is intended for content you are authorized to access/download.
+(Note: -h here is a custom flag for passing a single URL -- not the
+default argparse help. Use --help to see this usage text.)
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
+import os
 import re
+import shutil
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from playwright.sync_api import (
-    BrowserContext,
-    Locator,
-    Page,
-    TimeoutError as PlaywrightTimeoutError,
-    sync_playwright,
-)
+from playwright.sync_api import Locator, Page, sync_playwright
+
+
+# Force real-time, unbuffered output. Without this, on some terminals
+# (especially when stdout isn't a real tty -- some IDE terminals, some
+# launchers) Python fully buffers stdout, so log lines can sit queued
+# up while input()'s prompt -- which is flushed immediately -- appears
+# to jump the queue and show up "too early". This makes every print
+# show up the instant it happens.
+try:
+    sys.stdout.reconfigure(line_buffering=True, write_through=True)
+except Exception:
+    pass
 
 
 # ============================================================
@@ -51,1510 +64,752 @@ BASE_DIR = Path(__file__).resolve().parent
 PROFILE_DIR = BASE_DIR / "browser" / "profile"
 OUTPUT_DIR = BASE_DIR / "output"
 
-DEFAULT_WAIT_AFTER_LOAD = 3.0
-DEFAULT_WAIT_AFTER_NEXT = 1.5
+# Chrome/Turbo download everything here first; we then sort each file
+# into its own per-URL subfolder under OUTPUT_DIR.
+STAGING_DIR = OUTPUT_DIR / "_incoming"
 
-MAX_STORIES = 500
+TURBO_EXTENSION_ID = "cpgaheeihidjmolbakklolchdplenjai"
 
-# How many consecutive unchanged states before we consider
-# the highlight stuck/finished.
-MAX_UNCHANGED_ATTEMPTS = 3
+MEDIA_EXTENSIONS = {
+    ".mp4", ".webm", ".mov", ".mkv", ".avi",
+    ".jpg", ".jpeg", ".png", ".webp", ".gif",
+}
 
-# Instagram can animate transitions.
-ANIMATION_SETTLE_TIME = 0.7
+# Turbo Downloader frequently saves files as a bare UUID with NO
+# extension at all (Chrome could not infer a type from the blob it
+# fetched). We must not filter those out. We DO still ignore
+# in-progress / temp download artifacts so we don't report a partial
+# file as "done".
+IGNORED_SUFFIXES = {".crdownload", ".tmp", ".partial", ".part", ".download"}
+
+PAGE_LOAD_WAIT = 3.0
+BUTTON_TIMEOUT = 30.0
+DOWNLOAD_WAIT = 120.0
+BETWEEN_URLS_WAIT = 2.0
 
 
 # ============================================================
-# LOGGING
+# PRETTY TERMINAL LOGGING
 # ============================================================
+
+class _C:
+    RESET = "\x1b[0m"
+    BOLD = "\x1b[1m"
+    DIM = "\x1b[2m"
+    RED = "\x1b[31m"
+    GREEN = "\x1b[32m"
+    YELLOW = "\x1b[33m"
+    BLUE = "\x1b[34m"
+    MAGENTA = "\x1b[35m"
+    CYAN = "\x1b[36m"
+    GRAY = "\x1b[90m"
+
+
+def _enable_windows_ansi() -> bool:
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        new_mode = mode.value | 0x0004
+        return bool(kernel32.SetConsoleMode(handle, new_mode))
+    except Exception:
+        return False
+
+
+_USE_COLOR = sys.stdout.isatty() and _enable_windows_ansi()
+
+
+def _paint(code: str, text: str) -> str:
+    if not _USE_COLOR:
+        return text
+    return f"{code}{text}{_C.RESET}"
+
+
+def _timestamp() -> str:
+    return _paint(_C.GRAY, datetime.now().strftime("%H:%M:%S"))
+
 
 def log(message: str) -> None:
-    now = datetime.now().strftime("%H:%M:%S")
-    print(f"[{now}] {message}")
+    print(f"{_timestamp()}  {_paint(_C.CYAN, 'i')}  {message}", flush=True)
+
+
+def ok(message: str) -> None:
+    print(f"{_timestamp()}  {_paint(_C.GREEN, '+')}  {_paint(_C.GREEN, message)}", flush=True)
 
 
 def warn(message: str) -> None:
-    print(f"[WARNING] {message}")
+    print(f"{_timestamp()}  {_paint(_C.YELLOW, '!')}  {_paint(_C.YELLOW, message)}", flush=True)
 
 
 def error(message: str) -> None:
-    print(f"[ERROR] {message}")
+    print(f"{_timestamp()}  {_paint(_C.RED, 'x')}  {_paint(_C.RED, message)}", flush=True)
+
+
+def section(title: str) -> None:
+    line = "-" * 70
+    print(flush=True)
+    print(_paint(_C.BLUE, line), flush=True)
+    print(_paint(_C.BOLD + _C.BLUE, f" {title}"), flush=True)
+    print(_paint(_C.BLUE, line), flush=True)
+
+
+def banner(title: str) -> None:
+    line = "=" * 70
+    print(_paint(_C.MAGENTA, line), flush=True)
+    print(_paint(_C.BOLD + _C.MAGENTA, f" {title}"), flush=True)
+    print(_paint(_C.MAGENTA, line), flush=True)
 
 
 # ============================================================
-# HASHING
+# CHROME DOWNLOAD LOCATION HELPERS
 # ============================================================
 
-def sha256_file(path: Path) -> str:
-    """Return SHA-256 hash of a file."""
-
-    digest = hashlib.sha256()
-
-    with path.open("rb") as f:
-        while True:
-            chunk = f.read(1024 * 1024)
-
-            if not chunk:
-                break
-
-            digest.update(chunk)
-
-    return digest.hexdigest()
-
-
-# ============================================================
-# OUTPUT
-# ============================================================
-
-def make_output_dir(url: str) -> Path:
-    """
-    Create a deterministic-ish output directory.
-
-    Example:
-
-        output/
-            highlight_18024150727811997/
-    """
-
-    match = re.search(r"/highlights/([^/?#]+)", url)
-
-    if match:
-        identifier = match.group(1)
-    else:
-        identifier = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    safe_identifier = re.sub(
-        r"[^a-zA-Z0-9_.-]+",
-        "_",
-        identifier,
-    )
-
-    directory = OUTPUT_DIR / f"highlight_{safe_identifier}"
-    directory.mkdir(parents=True, exist_ok=True)
-
-    return directory
-
-
-# ============================================================
-# INSTAGRAM STATE
-# ============================================================
-
-def is_login_page(page: Page) -> bool:
-    """
-    Basic detection for Instagram login screen.
-    """
-
-    url = page.url.lower()
-
-    if "/accounts/login" in url:
-        return True
-
+def read_chrome_default_download_dir() -> Optional[Path]:
+    """Read download.default_directory straight from the profile's
+    Preferences JSON, so we watch wherever Chrome/Turbo is ACTUALLY
+    configured to save files, instead of guessing."""
+    pref_path = PROFILE_DIR / "Default" / "Preferences"
+    if not pref_path.is_file():
+        return None
     try:
-        if page.get_by_role(
-            "heading",
-            name=re.compile(r"log in|login", re.I),
-        ).count():
-            return True
+        data = json.loads(pref_path.read_text(encoding="utf-8"))
+        raw = data.get("download", {}).get("default_directory")
+        if raw:
+            return Path(raw)
     except Exception:
         pass
-
-    return False
-
-
-def wait_for_manual_login(page: Page) -> None:
-    """
-    On first run, give the user time to log into Instagram.
-    """
-
-    if not is_login_page(page):
-        return
-
-    print()
-    print("=" * 70)
-    print("Instagram login required")
-    print("=" * 70)
-    print()
-    print("A Chromium window has opened.")
-    print("Log into Instagram manually in that window.")
-    print()
-    print("After you are logged in, the script will detect it automatically.")
-    print()
-    print("Do NOT close the browser.")
-    print("=" * 70)
-    print()
-
-    while True:
-
-        if not is_login_page(page):
-            log("Instagram login detected.")
-            break
-
-        time.sleep(2)
-
-
-# ============================================================
-# VIEW STORY BUTTON
-# ============================================================
-
-def find_view_story_button(page: Page) -> Optional[Locator]:
-    """
-    Find Instagram's "View story" confirmation button.
-
-    Instagram may change its DOM, so several strategies are used.
-    """
-
-    candidates = []
-
-    # --------------------------------------------------------
-    # Strategy 1: ARIA button
-    # --------------------------------------------------------
-
-    aria_patterns = [
-        r"view story",
-        r"مشاهده.*استوری",
-        r"دیدن.*استوری",
-    ]
-
-    for pattern in aria_patterns:
-        try:
-            locator = page.get_by_role(
-                "button",
-                name=re.compile(pattern, re.I),
-            )
-
-            candidates.append(("ARIA", locator))
-
-        except Exception:
-            pass
-
-    # --------------------------------------------------------
-    # Strategy 2: text
-    # --------------------------------------------------------
-
-    text_patterns = [
-        r"view story",
-        r"مشاهده.*استوری",
-        r"دیدن.*استوری",
-    ]
-
-    for pattern in text_patterns:
-        try:
-            locator = page.get_by_text(
-                re.compile(pattern, re.I)
-            )
-
-            candidates.append(("TEXT", locator))
-
-        except Exception:
-            pass
-
-    # --------------------------------------------------------
-    # Strategy 3: button containing matching text
-    # --------------------------------------------------------
-
-    try:
-        locator = page.locator(
-            "button"
-        ).filter(
-            has_text=re.compile(
-                r"view story|مشاهده.*استوری|دیدن.*استوری",
-                re.I,
-            )
-        )
-
-        candidates.append(("BUTTON-TEXT", locator))
-
-    except Exception:
-        pass
-
-    # --------------------------------------------------------
-    # Return first visible candidate
-    # --------------------------------------------------------
-
-    for source, locator in candidates:
-
-        try:
-            count = locator.count()
-
-            for i in range(count):
-
-                candidate = locator.nth(i)
-
-                if not candidate.is_visible():
-                    continue
-
-                box = candidate.bounding_box()
-
-                if not box:
-                    continue
-
-                # Ignore tiny unrelated text elements.
-                if box["width"] < 40 or box["height"] < 20:
-                    continue
-
-                log(
-                    f"'View story' button found using {source}."
-                )
-
-                return candidate
-
-        except Exception:
-            continue
-
     return None
 
 
-def click_view_story(page: Page) -> bool:
-    """
-    Automatically click Instagram's "View story" confirmation
-    if it is present.
+def candidate_download_dirs() -> list[Path]:
+    """Directories where Chrome/Turbo may actually place downloads."""
+    dirs = [STAGING_DIR]
 
-    Returns:
-        True  -> button was found and clicked
-        False -> button was not found
-    """
+    user_home = Path.home()
+    dirs.extend([
+        user_home / "Downloads",
+        user_home / "Downloads" / "Instagram",
+        user_home / "Downloads" / "Turbo Downloader",
+        user_home / "Desktop",
+    ])
 
-    log("Checking for 'View story'...")
+    pref_dir = read_chrome_default_download_dir()
+    if pref_dir:
+        dirs.append(pref_dir)
 
-    button = find_view_story_button(page)
+    out: list[Path] = []
+    seen = set()
+    for d in dirs:
+        try:
+            key = str(d.resolve()).lower()
+        except Exception:
+            key = str(d).lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(d)
+    return out
 
-    if not button:
-        log("'View story' button not found. Continuing...")
-        return False
 
-    try:
-        button.scroll_into_view_if_needed()
-    except Exception:
-        pass
+def is_candidate_media_file(p: Path) -> bool:
+    suffix = p.suffix.lower()
 
-    time.sleep(0.3)
+    if suffix in IGNORED_SUFFIXES:
+        return False  # still downloading
 
-    # --------------------------------------------------------
-    # Normal click
-    # --------------------------------------------------------
-
-    try:
-
-        button.click(timeout=3000)
-
-        log("Clicked 'View story'.")
-
-        time.sleep(2)
-
+    if suffix in MEDIA_EXTENSIONS:
         return True
 
-    except Exception as exc:
-
-        warn(
-            f"Normal 'View story' click failed: {exc}"
-        )
-
-    # --------------------------------------------------------
-    # Force click fallback
-    # --------------------------------------------------------
-
-    try:
-
-        button.click(
-            timeout=3000,
-            force=True,
-        )
-
-        log("Clicked 'View story' using force click.")
-
-        time.sleep(2)
-
+    # Turbo often saves with NO extension at all -- accept those too.
+    if suffix == "":
         return True
-
-    except Exception as exc:
-
-        warn(
-            f"Force 'View story' click failed: {exc}"
-        )
 
     return False
 
 
-def wait_for_story_to_open(page: Page, timeout: float = 8.0) -> bool:
-    """
-    Wait until the actual Story media appears after clicking
-    "View story".
+def snapshot_media_files() -> dict[str, tuple[int, int]]:
+    snapshot: dict[str, tuple[int, int]] = {}
+    for root in candidate_download_dirs():
+        if not root.exists() or not root.is_dir():
+            continue
+        try:
+            for p in root.rglob("*"):
+                if p.is_file() and is_candidate_media_file(p):
+                    try:
+                        st = p.stat()
+                        snapshot[str(p.resolve()).lower()] = (st.st_size, st.st_mtime_ns)
+                    except OSError:
+                        pass
+        except (OSError, PermissionError):
+            pass
+    return snapshot
 
-    This prevents taking a screenshot of the confirmation screen.
-    """
 
+def count_all_files_per_dir() -> dict[str, int]:
+    """Diagnostic helper: total file count per watched dir, regardless
+    of extension."""
+    counts: dict[str, int] = {}
+    for root in candidate_download_dirs():
+        if not root.exists() or not root.is_dir():
+            counts[str(root)] = -1
+            continue
+        try:
+            counts[str(root)] = sum(1 for p in root.rglob("*") if p.is_file())
+        except (OSError, PermissionError):
+            counts[str(root)] = -1
+    return counts
+
+
+def find_new_media(before: dict[str, tuple[int, int]]) -> list[tuple[Path, tuple[int, int]]]:
+    """Return media files that appeared or changed after the Turbo click."""
+    after = snapshot_media_files()
+    changed = []
+    for path, meta in after.items():
+        if path not in before or before[path] != meta:
+            changed.append((Path(path), meta))
+    return changed
+
+
+def wait_for_new_media(
+    before: dict[str, tuple[int, int]],
+    timeout: float = 120,
+    stable_window: float = 6.0,
+):
+    """Keep watching until new files stop appearing for `stable_window`
+    seconds (so a multi-file "Download all stories" batch has time to
+    fully land, not just its first file), or until `timeout` is hit."""
     deadline = time.time() + timeout
+    last_report = 0.0
+    last_change_time: Optional[float] = None
+    latest: list[tuple[Path, tuple[int, int]]] = []
 
     while time.time() < deadline:
+        changed = find_new_media(before)
 
-        try:
+        if len(changed) != len(latest):
+            log(f"  ...{len(changed)} file(s) detected so far, still watching for more.")
 
-            # Look for a large visible image/video.
-            elements = page.locator("img, video")
+        if changed:
+            latest = changed
+            last_change_time = time.time()
 
-            count = elements.count()
+        if last_change_time is not None and (time.time() - last_change_time) >= stable_window:
+            return latest
 
-            for i in range(count):
+        if time.time() - last_report > 15:
+            last_report = time.time()
+            counts = count_all_files_per_dir()
+            summary = ", ".join(f"{d} ({n} files)" for d, n in counts.items())
+            log(f"Waiting for downloaded media... watching: {summary}")
 
-                try:
+        time.sleep(1.5)
 
-                    element = elements.nth(i)
-
-                    if not element.is_visible():
-                        continue
-
-                    box = element.bounding_box()
-
-                    if not box:
-                        continue
-
-                    if box["width"] >= 250 and box["height"] >= 250:
-                        log("Story media detected.")
-                        return True
-
-                except Exception:
-                    continue
-
-        except Exception:
-            pass
-
-        time.sleep(0.4)
-
-    warn("Could not confidently detect Story media.")
-
-    return False
+    return latest
 
 
-# ============================================================
-# STORY AREA DETECTION
-# ============================================================
+# Signature (magic bytes) -> extension, checked in order. Covers what
+# Turbo actually saves from Instagram: mp4 video and jpg/png/webp
+# images are the overwhelming majority.
+_SIGNATURES: list[tuple[bytes, Optional[int], str]] = [
+    # (signature bytes, offset to check at, extension)
+    (b"\xff\xd8\xff", 0, ".jpg"),
+    (b"\x89PNG\r\n\x1a\n", 0, ".png"),
+    (b"GIF87a", 0, ".gif"),
+    (b"GIF89a", 0, ".gif"),
+    (b"RIFF", 0, ".webp"),  # confirmed further below (WEBP at offset 8)
+    (b"\x1a\x45\xdf\xa3", 0, ".webm"),
+    (b"ftyp", 4, ".mp4"),  # ISO base media container (mp4/mov/m4v/heic...)
+]
 
-def get_story_media_signature(page: Page) -> Optional[str]:
-    """
-    Try to obtain a signature representing the currently visible
-    Story media.
 
-    We inspect visible IMG and VIDEO elements.
-
-    This is not used as the only duplicate detector;
-    the actual screenshot hash remains the final authority.
-    """
-
+def guess_extension(path: Path) -> Optional[str]:
+    """Sniff a file's actual content to determine its real type, since
+    Turbo Downloader frequently saves files with NO extension at all.
+    Returns a leading-dot extension like '.mp4', or None if unknown."""
     try:
-
-        candidates = page.locator("img, video").all()
-
-        signatures = []
-
-        for element in candidates:
-
-            try:
-
-                if not element.is_visible():
-                    continue
-
-                box = element.bounding_box()
-
-                if not box:
-                    continue
-
-                width = box["width"]
-                height = box["height"]
-
-                # Story media is normally large.
-                if width < 200 or height < 200:
-                    continue
-
-                tag = element.evaluate(
-                    "(el) => el.tagName.toLowerCase()"
-                )
-
-                if tag == "img":
-
-                    src = (
-                        element.get_attribute("src")
-                        or element.get_attribute("currentSrc")
-                    )
-
-                    if src:
-
-                        signatures.append(
-                            f"img:{src}:{round(width)}x{round(height)}"
-                        )
-
-                elif tag == "video":
-
-                    src = (
-                        element.get_attribute("src")
-                        or element.get_attribute("currentSrc")
-                    )
-
-                    if src:
-
-                        signatures.append(
-                            f"video:{src}:{round(width)}x{round(height)}"
-                        )
-
-            except Exception:
-                continue
-
-        if not signatures:
-            return None
-
-        signatures.sort()
-
-        combined = "|".join(signatures)
-
-        return hashlib.sha256(
-            combined.encode("utf-8")
-        ).hexdigest()
-
-    except Exception:
+        with open(path, "rb") as f:
+            head = f.read(64)
+    except OSError:
         return None
 
-
-# ============================================================
-# NEXT BUTTON DETECTION
-# ============================================================
-
-def visible(locator: Locator) -> bool:
-    """
-    Safely check whether a locator is visible.
-    """
-
-    try:
-        return locator.count() > 0 and locator.first.is_visible()
-    except Exception:
-        return False
-
-
-def find_next_button(page: Page) -> Optional[Locator]:
-    """
-    Find Instagram's Next Story button using multiple strategies.
-
-    Instagram changes DOM structure frequently, so we intentionally
-    don't rely on one CSS selector.
-    """
-
-    candidates = []
-
-    # --------------------------------------------------------
-    # Strategy 1: ARIA button name
-    # --------------------------------------------------------
-
-    aria_names = [
-        r"next",
-        r"next story",
-        r"next photo",
-        r"next video",
-        r"بعدی",
-    ]
-
-    for pattern in aria_names:
-
-        try:
-
-            locator = page.get_by_role(
-                "button",
-                name=re.compile(pattern, re.I),
-            )
-
-            candidates.append(
-                ("ARIA", locator)
-            )
-
-        except Exception:
-            pass
-
-    # --------------------------------------------------------
-    # Strategy 2: title attribute
-    # --------------------------------------------------------
-
-    title_patterns = [
-        r"next",
-        r"next story",
-        r"بعدی",
-    ]
-
-    for pattern in title_patterns:
-
-        try:
-
-            locator = page.locator(
-                f'[title*="{pattern}" i]'
-            )
-
-            candidates.append(
-                ("TITLE", locator)
-            )
-
-        except Exception:
-            pass
-
-    # --------------------------------------------------------
-    # Strategy 3: aria-label
-    # --------------------------------------------------------
-
-    aria_patterns = [
-        r"next",
-        r"next story",
-        r"بعدی",
-    ]
-
-    for pattern in aria_patterns:
-
-        try:
-
-            locator = page.locator(
-                f'[aria-label*="{pattern}" i]'
-            )
-
-            candidates.append(
-                ("ARIA-LABEL", locator)
-            )
-
-        except Exception:
-            pass
-
-    # --------------------------------------------------------
-    # Return first visible candidate
-    # --------------------------------------------------------
-
-    for source, locator in candidates:
-
-        try:
-
-            count = locator.count()
-
-            for i in range(count):
-
-                candidate = locator.nth(i)
-
-                if not candidate.is_visible():
-                    continue
-
-                box = candidate.bounding_box()
-
-                if not box:
-                    continue
-
-                viewport = page.viewport_size
-
-                if viewport:
-
-                    center_x = (
-                        box["x"]
-                        + box["width"] / 2
-                    )
-
-                    if center_x < viewport["width"] * 0.55:
-                        continue
-
-                log(
-                    f"Next button found using {source}."
-                )
-
-                return candidate
-
-        except Exception:
-            continue
-
-    # --------------------------------------------------------
-    # Strategy 4: geometric detection
-    #
-    # Look for clickable elements in the right side of the
-    # viewport with an SVG/icon.
-    # --------------------------------------------------------
-
-    try:
-
-        viewport = page.viewport_size
-
-        if viewport:
-
-            elements = page.locator(
-                "button, [role='button']"
-            )
-
-            count = elements.count()
-
-            possible = []
-
-            for i in range(count):
-
-                try:
-
-                    element = elements.nth(i)
-
-                    if not element.is_visible():
-                        continue
-
-                    box = element.bounding_box()
-
-                    if not box:
-                        continue
-
-                    center_x = (
-                        box["x"]
-                        + box["width"] / 2
-                    )
-
-                    center_y = (
-                        box["y"]
-                        + box["height"] / 2
-                    )
-
-                    # Right side.
-                    if center_x < viewport["width"] * 0.70:
-                        continue
-
-                    # Ignore extreme top/bottom.
-                    if center_y < viewport["height"] * 0.15:
-                        continue
-
-                    if center_y > viewport["height"] * 0.85:
-                        continue
-
-                    area = (
-                        box["width"]
-                        * box["height"]
-                    )
-
-                    possible.append(
-                        (area, element)
-                    )
-
-                except Exception:
-                    continue
-
-            if possible:
-
-                # Usually navigation button is reasonably small.
-                possible.sort(
-                    key=lambda x: x[0]
-                )
-
-                for _, element in possible:
-
-                    try:
-
-                        if element.is_visible():
-
-                            log(
-                                "Next button found using "
-                                "geometric fallback."
-                            )
-
-                            return element
-
-                    except Exception:
-                        continue
-
-    except Exception:
-        pass
+    if len(head) >= 12 and head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return ".webp"
+
+    for signature, offset, ext in _SIGNATURES:
+        if signature == b"RIFF":
+            continue  # handled above with the WEBP sub-check
+        end = offset + len(signature)
+        if len(head) >= end and head[offset:end] == signature:
+            return ext
 
     return None
 
 
-# ============================================================
-# STORY SCREENSHOT
-# ============================================================
+def move_downloaded_files(
+    downloaded: list[tuple[Path, tuple[int, int]]],
+    dest_dir: Path,
+) -> tuple[list[Path], int, int]:
+    """Move every detected file into dest_dir, giving it a correct file
+    extension (sniffed from its content) if it doesn't already have
+    one. Returns (moved_paths, renamed_count, unresolved_count)."""
+    dest_dir.mkdir(parents=True, exist_ok=True)
 
-def screenshot_story(
-    page: Page,
-    output_path: Path,
-) -> str:
-    """
-    Take viewport screenshot.
+    moved: list[Path] = []
+    renamed_count = 0
+    unresolved_count = 0
 
-    Returns SHA-256 hash.
-    """
+    for path, _meta in downloaded:
+        if not path.exists():
+            continue
 
-    page.screenshot(
-        path=str(output_path),
-        animations="disabled",
-    )
+        name = path.name
 
-    return sha256_file(output_path)
-
-
-# ============================================================
-# WAIT FOR STORY CHANGE
-# ============================================================
-
-def wait_for_story_change(
-    page: Page,
-    old_hash: str,
-    timeout: float = 6.0,
-) -> bool:
-    """
-    After clicking Next, wait until the viewport screenshot
-    actually changes.
-
-    This prevents capturing the same Story twice because the
-    click happened before Instagram finished transitioning.
-    """
-
-    deadline = time.time() + timeout
-
-    while time.time() < deadline:
-
-        time.sleep(0.35)
-
-        temp_path = OUTPUT_DIR / "__story_probe.png"
-
-        try:
-
-            page.screenshot(
-                path=str(temp_path),
-                animations="disabled",
-            )
-
-            new_hash = sha256_file(
-                temp_path
-            )
-
-            try:
-                temp_path.unlink()
-            except Exception:
-                pass
-
-            if new_hash != old_hash:
-
-                time.sleep(
-                    ANIMATION_SETTLE_TIME
+        if path.suffix == "":
+            guessed = guess_extension(path)
+            if guessed:
+                name = f"{path.stem}{guessed}"
+                renamed_count += 1
+            else:
+                unresolved_count += 1
+                warn(
+                    f"Could not detect the file type of {path.name}; "
+                    "keeping it without an extension -- you may need to "
+                    "check it manually."
                 )
 
-                return True
+        stem = Path(name).stem
+        suffix = Path(name).suffix
+        target = dest_dir / name
+        counter = 1
+        while target.exists():
+            target = dest_dir / f"{stem}_{counter}{suffix}"
+            counter += 1
 
-        except Exception:
-
-            try:
-                temp_path.unlink()
-            except Exception:
-                pass
-
-    return False
-
-
-# ============================================================
-# CLICK NEXT
-# ============================================================
-
-def click_next(page: Page) -> bool:
-    """
-    Locate and click Next.
-    """
-
-    button = find_next_button(page)
-
-    if not button:
-        return False
-
-    try:
-
-        button.scroll_into_view_if_needed()
-
-        time.sleep(0.2)
-
-        button.click(
-            timeout=3000,
-        )
-
-        return True
-
-    except Exception as exc:
-
-        warn(
-            f"Normal click failed: {exc}"
-        )
-
-        # Force click fallback.
         try:
+            shutil.move(str(path), str(target))
+            moved.append(target)
+        except OSError as exc:
+            warn(f"Could not move {path} -> {target}: {exc}")
 
-            button.click(
-                timeout=2000,
-                force=True,
-            )
-
-            return True
-
-        except Exception as exc2:
-
-            warn(
-                f"Force click failed: {exc2}"
-            )
-
-            return False
+    return moved, renamed_count, unresolved_count
 
 
 # ============================================================
-# DEBUG
+# OUTPUT FOLDER NAMING
 # ============================================================
 
-def save_debug(
-    page: Page,
-    output_dir: Path,
-) -> None:
-    """
-    Save diagnostic files if automation gets stuck.
-    """
+def slug_for_url(url: str, index: int) -> str:
+    match = re.search(r"/highlights/(\d+)", url)
+    if match:
+        return f"highlight_{match.group(1)}"
 
-    timestamp = datetime.now().strftime(
-        "%Y%m%d_%H%M%S"
-    )
-
-    screenshot_path = (
-        output_dir
-        / f"DEBUG_{timestamp}.png"
-    )
-
-    html_path = (
-        output_dir
-        / f"DEBUG_{timestamp}.html"
-    )
-
-    try:
-
-        page.screenshot(
-            path=str(screenshot_path),
-            full_page=False,
-        )
-
-        html = page.content()
-
-        html_path.write_text(
-            html,
-            encoding="utf-8",
-        )
-
-        log(
-            f"Debug screenshot: {screenshot_path}"
-        )
-
-        log(
-            f"Debug HTML: {html_path}"
-        )
-
-    except Exception as exc:
-
-        warn(
-            f"Could not save debug data: {exc}"
-        )
+    tail = url.rstrip("/").split("/")[-1]
+    tail = re.sub(r"[^A-Za-z0-9_-]+", "_", tail).strip("_")
+    return tail or f"url_{index}"
 
 
 # ============================================================
-# METADATA
+# TURBO EXTENSION
 # ============================================================
 
-def save_metadata(
-    output_dir: Path,
-    url: str,
-    screenshots: list[dict],
-    stopped_reason: str,
-) -> None:
+def find_turbo_extension() -> Optional[Path]:
+    """Find Turbo Downloader in installed Chrome profiles."""
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if not local_app_data:
+        return None
 
-    metadata = {
-        "source_url": url,
-        "captured_at": datetime.now(
-            timezone.utc
-        ).isoformat(),
-        "stories_captured": len(
-            screenshots
-        ),
-        "stopped_reason": stopped_reason,
-        "screenshots": screenshots,
-    }
+    user_data = Path(local_app_data) / "Google" / "Chrome" / "User Data"
+    if not user_data.exists():
+        return None
 
-    path = output_dir / "metadata.json"
+    candidates: list[Path] = []
 
-    path.write_text(
-        json.dumps(
-            metadata,
-            indent=2,
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
+    for profile_dir in user_data.iterdir():
+        if not profile_dir.is_dir():
+            continue
+
+        ext_root = profile_dir / "Extensions" / TURBO_EXTENSION_ID
+        if not ext_root.is_dir():
+            continue
+
+        for version_dir in ext_root.iterdir():
+            if not version_dir.is_dir():
+                continue
+            if (version_dir / "manifest.json").is_file():
+                candidates.append(version_dir)
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda p: (p.stat().st_mtime, p.name), reverse=True)
+    return candidates[0]
 
 
 # ============================================================
-# MAIN CAPTURE LOOP
+# INPUT / CLI
 # ============================================================
 
-def capture_highlight(
-    page: Page,
-    url: str,
-    output_dir: Path,
-) -> None:
+def is_instagram_url(value: str) -> bool:
+    value = value.strip()
+    return bool(re.match(r"^https?://(www\.)?instagram\.com/", value, re.I))
 
-    log("Opening highlight:")
-    log(f"  {url}")
 
-    page.goto(
-        url,
-        wait_until="domcontentloaded",
-        timeout=60000,
-    )
+def load_urls(
+    direct_urls: list[str],
+    highlight_url: Optional[str],
+    input_file: Optional[str],
+) -> list[str]:
 
-    time.sleep(
-        DEFAULT_WAIT_AFTER_LOAD
-    )
+    urls: list[str] = []
 
-    # --------------------------------------------------------
-    # Login
-    # --------------------------------------------------------
+    all_direct = list(direct_urls)
+    if highlight_url:
+        all_direct.append(highlight_url)
 
-    wait_for_manual_login(page)
+    for url in all_direct:
+        url = url.strip()
+        if not url:
+            continue
+        if not is_instagram_url(url):
+            warn(f"Skipping invalid Instagram URL: {url}")
+            continue
+        urls.append(url)
 
-    # --------------------------------------------------------
-    # Wait after login
-    # --------------------------------------------------------
+    if input_file:
+        path = Path(input_file)
+        if not path.is_file():
+            error(f"Input file not found: {path}")
+            sys.exit(1)
 
-    time.sleep(3)
-
-    log("Current URL:")
-    log(f"  {page.url}")
-
-    # --------------------------------------------------------
-    # Check URL
-    # --------------------------------------------------------
-
-    if "/stories/" not in page.url:
-
-        warn(
-            "The current URL does not look like an Instagram "
-            "Story/Highlight URL."
-        )
-
-    # --------------------------------------------------------
-    # NEW:
-    # Automatically handle Instagram's "View story" screen.
-    # --------------------------------------------------------
-
-    clicked_view_story = click_view_story(page)
-
-    if clicked_view_story:
-
-        # Give Instagram time to transition from the
-        # confirmation screen into the actual Story.
-        wait_for_story_to_open(page)
-
-        time.sleep(
-            ANIMATION_SETTLE_TIME
-        )
-
-    # --------------------------------------------------------
-    # Capture loop
-    # --------------------------------------------------------
-
-    screenshots = []
-
-    known_hashes = set()
-
-    unchanged_attempts = 0
-
-    last_hash = None
-
-    stopped_reason = "unknown"
-
-    for story_index in range(
-        1,
-        MAX_STORIES + 1,
-    ):
-
-        log("")
-        log(
-            f"Processing Story #{story_index}"
-        )
-
-        time.sleep(
-            ANIMATION_SETTLE_TIME
-        )
-
-        # ----------------------------------------------------
-        # Temporary screenshot
-        # ----------------------------------------------------
-
-        temp_path = (
-            output_dir
-            / "__current.png"
-        )
-
-        page.screenshot(
-            path=str(temp_path),
-            animations="disabled",
-        )
-
-        current_hash = sha256_file(
-            temp_path
-        )
-
-        # ----------------------------------------------------
-        # Duplicate prevention
-        # ----------------------------------------------------
-
-        if current_hash in known_hashes:
-
-            log(
-                "This Story screenshot is already known."
-            )
-
-            try:
-                temp_path.unlink()
-            except Exception:
-                pass
-
-            stopped_reason = (
-                "duplicate_story_detected"
-            )
-
-            break
-
-        # ----------------------------------------------------
-        # Detect consecutive unchanged state
-        # ----------------------------------------------------
-
-        if (
-            last_hash is not None
-            and current_hash == last_hash
+        for line_number, raw in enumerate(
+            path.read_text(encoding="utf-8-sig").splitlines(), start=1
         ):
-
-            unchanged_attempts += 1
-
-            log(
-                f"Story has not changed "
-                f"({unchanged_attempts}/"
-                f"{MAX_UNCHANGED_ATTEMPTS})."
-            )
-
-            if (
-                unchanged_attempts
-                >= MAX_UNCHANGED_ATTEMPTS
-            ):
-
-                try:
-                    temp_path.unlink()
-                except Exception:
-                    pass
-
-                stopped_reason = (
-                    "story_did_not_change"
-                )
-
-                break
-
-        else:
-
-            unchanged_attempts = 0
-
-        last_hash = current_hash
-
-        # ----------------------------------------------------
-        # Save final screenshot
-        # ----------------------------------------------------
-
-        final_path = (
-            output_dir
-            / f"{story_index:03d}.png"
-        )
-
-        temp_path.replace(
-            final_path
-        )
-
-        known_hashes.add(
-            current_hash
-        )
-
-        log(
-            f"Saved: {final_path.name}"
-        )
-
-        screenshots.append(
-            {
-                "index": story_index,
-                "file": final_path.name,
-                "sha256": current_hash,
-                "captured_at": datetime.now(
-                    timezone.utc
-                ).isoformat(),
-            }
-        )
-
-        # ----------------------------------------------------
-        # Maximum story limit
-        # ----------------------------------------------------
-
-        if story_index >= MAX_STORIES:
-
-            stopped_reason = (
-                "maximum_story_limit_reached"
-            )
-
-            warn(
-                f"Reached MAX_STORIES={MAX_STORIES}."
-            )
-
-            break
-
-        # ----------------------------------------------------
-        # Find Next
-        # ----------------------------------------------------
-
-        log(
-            "Looking for Next button..."
-        )
-
-        next_button = find_next_button(
-            page
-        )
-
-        if not next_button:
-
-            log(
-                "No Next button found."
-            )
-
-            stopped_reason = (
-                "next_button_not_found"
-            )
-
-            save_debug(
-                page,
-                output_dir,
-            )
-
-            break
-
-        # ----------------------------------------------------
-        # Click Next
-        # ----------------------------------------------------
-
-        log(
-            "Clicking Next..."
-        )
-
-        try:
-
-            next_button.scroll_into_view_if_needed()
-
-        except Exception:
-            pass
-
-        try:
-
-            next_button.click(
-                timeout=3000,
-            )
-
-        except Exception as exc:
-
-            warn(
-                f"Click failed: {exc}"
-            )
-
-            try:
-
-                next_button.click(
-                    timeout=3000,
-                    force=True,
-                )
-
-            except Exception as exc2:
-
-                error(
-                    f"Force click also failed: {exc2}"
-                )
-
-                stopped_reason = (
-                    "next_button_click_failed"
-                )
-
-                save_debug(
-                    page,
-                    output_dir,
-                )
-
-                break
-
-        # ----------------------------------------------------
-        # Wait for transition
-        # ----------------------------------------------------
-
-        log(
-            "Waiting for next Story..."
-        )
-
-        changed = wait_for_story_change(
-            page,
-            current_hash,
-        )
-
-        if not changed:
-
-            warn(
-                "The Story did not visibly change."
-            )
-
-            # Take one more attempt before giving up.
-            time.sleep(1)
-
-            retry_path = (
-                output_dir
-                / "__retry.png"
-            )
-
-            page.screenshot(
-                path=str(retry_path),
-                animations="disabled",
-            )
-
-            retry_hash = sha256_file(
-                retry_path
-            )
-
-            try:
-                retry_path.unlink()
-            except Exception:
-                pass
-
-            if retry_hash == current_hash:
-
-                stopped_reason = (
-                    "next_click_did_not_change_story"
-                )
-
-                save_debug(
-                    page,
-                    output_dir,
-                )
-
-                break
-
-        time.sleep(
-            DEFAULT_WAIT_AFTER_NEXT
-        )
-
-    else:
-
-        stopped_reason = (
-            "loop_finished"
-        )
-
-    # --------------------------------------------------------
-    # Save metadata
-    # --------------------------------------------------------
-
-    save_metadata(
-        output_dir,
-        url,
-        screenshots,
-        stopped_reason,
-    )
-
-    log("")
-    log("=" * 70)
-    log("DONE")
-    log("=" * 70)
-
-    log(
-        f"Stories captured: {len(screenshots)}"
-    )
-
-    log(
-        f"Stopped because: {stopped_reason}"
-    )
-
-    log(
-        f"Output: {output_dir}"
-    )
-
-    log("=" * 70)
-
-
-# ============================================================
-# ARGUMENTS
-# ============================================================
-
-def parse_args():
-
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if not is_instagram_url(line):
+                warn(f"Skipping invalid URL in {path.name} line {line_number}: {line}")
+                continue
+            urls.append(line)
+
+    seen = set()
+    unique_urls = []
+    for url in urls:
+        if url in seen:
+            continue
+        seen.add(url)
+        unique_urls.append(url)
+
+    return unique_urls
+
+
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=(
-            "Automatically screenshot every Story "
-            "inside an Instagram Highlight."
-        )
+        description="Instagram Highlight Downloader (Turbo Downloader extension only)",
+        add_help=False,
     )
 
     parser.add_argument(
-        "url",
-        help=(
-            "Instagram Highlight URL, e.g. "
-            "https://www.instagram.com/stories/highlights/..."
-        ),
+        "urls",
+        nargs="*",
+        help="One or more Instagram highlight URLs",
     )
 
     parser.add_argument(
-        "--max-stories",
-        type=int,
-        default=MAX_STORIES,
-        help=(
-            f"Maximum number of Stories to capture "
-            f"(default: {MAX_STORIES})"
-        ),
+        "-H", "-h", "--highlight",
+        dest="highlight_url",
+        metavar="URL",
+        help="Pass a single Instagram highlight URL via flag instead of positionally",
     )
 
     parser.add_argument(
-        "--wait",
-        type=float,
-        default=DEFAULT_WAIT_AFTER_NEXT,
-        help=(
-            f"Seconds to wait after Next "
-            f"(default: {DEFAULT_WAIT_AFTER_NEXT})"
-        ),
+        "-i", "--input",
+        dest="input_file",
+        metavar="FILE",
+        help="Text file containing one Instagram URL per line",
+    )
+
+    parser.add_argument(
+        "--help",
+        action="help",
+        help="Show this help message and exit",
     )
 
     return parser.parse_args()
 
 
 # ============================================================
-# ENTRY POINT
+# LOGIN / STORY / TURBO INTERACTION
 # ============================================================
 
-def main():
+def is_login_page(page: Page) -> bool:
+    if "/accounts/login" in page.url.lower():
+        return True
+    try:
+        return page.get_by_role(
+            "heading", name=re.compile(r"log in|login", re.I)
+        ).count() > 0
+    except Exception:
+        return False
 
+
+def wait_for_login(page: Page) -> None:
+    if not is_login_page(page):
+        return
+
+    section("Instagram login required")
+    print("Log in manually in the opened Chromium window.")
+    print("The script will continue automatically once you're logged in.")
+
+    while is_login_page(page):
+        time.sleep(2)
+
+    ok("Instagram login detected.")
+
+
+def click_view_story(page: Page) -> bool:
+    patterns = (r"view story", r"مشاهده.*استوری", r"دیدن.*استوری")
+
+    for pattern in patterns:
+        try:
+            locator = page.get_by_role("button", name=re.compile(pattern, re.I))
+            for i in range(locator.count()):
+                element = locator.nth(i)
+                if not element.is_visible():
+                    continue
+                element.click(timeout=5000)
+                log("Clicked 'View story'.")
+                time.sleep(2)
+                return True
+        except Exception:
+            pass
+
+    return False
+
+
+def visible_exact_button(page: Page, title: str) -> Optional[Locator]:
+    locator = page.locator(f'[title="{title}"]')
+    try:
+        count = locator.count()
+        for i in range(count):
+            element = locator.nth(i)
+            if not element.is_visible():
+                continue
+            box = element.bounding_box()
+            if not box:
+                continue
+            if box["width"] < 8 or box["height"] < 8:
+                continue
+            return element
+    except Exception:
+        pass
+    return None
+
+
+def wait_for_turbo_buttons(
+    page: Page, timeout: float = BUTTON_TIMEOUT
+) -> tuple[Optional[Locator], Optional[Locator]]:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        all_button = visible_exact_button(page, "Download all stories")
+        current_button = visible_exact_button(page, "Download current story")
+        if all_button or current_button:
+            return all_button, current_button
+        time.sleep(0.5)
+    return None, None
+
+
+def click_turbo_for_url(page: Page) -> str:
+    log("Looking for Turbo Downloader buttons...")
+
+    all_button, current_button = wait_for_turbo_buttons(page)
+
+    if all_button:
+        ok('Turbo: "Download all stories" found -- clicking it.')
+        all_button.click(timeout=5000)
+        return "all"
+
+    if current_button:
+        warn('Turbo: "Download all stories" not found.')
+        log('Turbo: falling back to "Download current story".')
+        current_button.click(timeout=5000)
+        return "current"
+
+    raise RuntimeError("Turbo Downloader buttons were not found.")
+
+
+# ============================================================
+# ONE URL
+# ============================================================
+
+def process_url(page: Page, url: str, index: int, total: int) -> dict:
+    section(f"URL {index}/{total}")
+    print(url)
+
+    dest_dir = OUTPUT_DIR / slug_for_url(url, index)
+    log(f"Output folder: {dest_dir}")
+
+    result = {
+        "url": url,
+        "success": False,
+        "saved": 0,
+        "renamed": 0,
+        "unresolved": 0,
+    }
+
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        time.sleep(PAGE_LOAD_WAIT)
+
+        wait_for_login(page)
+        click_view_story(page)
+        time.sleep(2)
+
+        before = snapshot_media_files()
+        mode = click_turbo_for_url(page)
+
+        if mode == "all":
+            log("Turbo bulk download started.")
+        else:
+            log("Turbo single-story fallback started.")
+
+        downloaded = wait_for_new_media(before, timeout=DOWNLOAD_WAIT)
+
+        if downloaded:
+            moved, renamed_count, unresolved_count = move_downloaded_files(downloaded, dest_dir)
+
+            result["success"] = True
+            result["saved"] = len(moved)
+            result["renamed"] = renamed_count
+            result["unresolved"] = unresolved_count
+
+            section(f"URL {index}/{total} -- summary")
+            ok(f"Downloaded : {len(moved)}/{len(moved)} file(s) confirmed saved")
+            if renamed_count:
+                ok(f"Format fix : {renamed_count} file(s) had their extension corrected automatically")
+            if unresolved_count:
+                warn(f"Format fix : {unresolved_count} file(s) could NOT be identified -- check manually")
+            ok(f"Saved to   : {dest_dir}")
+            for path in moved:
+                size = path.stat().st_size
+                print(f"             - {path.name}  ({size:,} bytes)")
+        else:
+            warn(
+                f"No new media file was detected within {DOWNLOAD_WAIT:.0f}s. "
+                "The extension may still be downloading, or using a "
+                "location this script isn't watching."
+            )
+
+        if mode == "all":
+            log("Waiting a little before processing the next URL...")
+            time.sleep(5)
+
+        return result
+
+    except Exception as exc:
+        error(f"URL failed: {exc}")
+        return result
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main() -> None:
     args = parse_args()
 
-    global MAX_STORIES
-    global DEFAULT_WAIT_AFTER_NEXT
+    urls = load_urls(args.urls, args.highlight_url, args.input_file)
 
-    MAX_STORIES = args.max_stories
-    DEFAULT_WAIT_AFTER_NEXT = args.wait
-
-    url = args.url.strip()
-
-    if not url.startswith(
-        "https://www.instagram.com/"
-    ):
-
-        error(
-            "Please provide an Instagram URL."
-        )
-
+    if not urls:
+        error("No Instagram URLs were supplied.")
+        print()
+        print("Examples:")
+        print('  python capture.py "https://www.instagram.com/stories/highlights/123/"')
+        print('  python capture.py -h "https://www.instagram.com/stories/highlights/123/"')
+        print('  python capture.py "https://www.instagram.com/stories/highlights/123/" -i inp.txt')
+        print("  python capture.py -i inp.txt")
         sys.exit(1)
 
-    output_dir = make_output_dir(
-        url
-    )
+    extension_path = find_turbo_extension()
+    if not extension_path:
+        error("Turbo Downloader extension was not found.")
+        error(f"Expected extension ID: {TURBO_EXTENSION_ID}")
+        sys.exit(1)
 
-    PROFILE_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    STAGING_DIR.mkdir(parents=True, exist_ok=True)
+    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
-    OUTPUT_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    log(
-        "Instagram Highlight Capture"
-    )
-
-    log(
-        f"Profile: {PROFILE_DIR}"
-    )
-
-    log(
-        f"Output: {output_dir}"
-    )
+    banner("Instagram Highlight Downloader")
+    log(f"URLs to process : {len(urls)}")
+    log(f"Profile         : {PROFILE_DIR}")
+    log(f"Output folder   : {OUTPUT_DIR}")
+    log(f"Turbo extension : {extension_path}")
 
     with sync_playwright() as p:
+        log("Starting Chromium...")
 
-        log(
-            "Starting Chromium..."
-        )
-
-        context: BrowserContext = (
-            p.chromium.launch_persistent_context(
-                user_data_dir=str(
-                    PROFILE_DIR
-                ),
-                headless=False,
-                viewport={
-                    "width": 1280,
-                    "height": 900,
-                },
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                ],
-            )
+        context = p.chromium.launch_persistent_context(
+            user_data_dir=str(PROFILE_DIR),
+            headless=False,
+            accept_downloads=True,
+            downloads_path=str(STAGING_DIR),
+            viewport={"width": 1280, "height": 900},
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                f"--disable-extensions-except={extension_path}",
+                f"--load-extension={extension_path}",
+            ],
         )
 
         try:
+            page = context.pages[0] if context.pages else context.new_page()
+            page.set_default_timeout(10000)
 
-            # ------------------------------------------------
-            # Reuse existing page if possible
-            # ------------------------------------------------
+            results = []
 
-            if context.pages:
+            for index, url in enumerate(urls, start=1):
+                results.append(process_url(page, url, index, len(urls)))
 
-                page = context.pages[0]
+                if index < len(urls):
+                    time.sleep(BETWEEN_URLS_WAIT)
 
+            successful_urls = sum(1 for r in results if r["success"])
+            total_saved = sum(r["saved"] for r in results)
+            total_renamed = sum(r["renamed"] for r in results)
+            total_unresolved = sum(r["unresolved"] for r in results)
+            failed_urls = [r["url"] for r in results if not r["success"]]
+
+            banner("ALL DONE")
+            if successful_urls == len(urls):
+                ok(f"URLs completed      : {successful_urls}/{len(urls)}  (all of them)")
             else:
+                warn(f"URLs completed      : {successful_urls}/{len(urls)}")
+                for u in failed_urls:
+                    warn(f"  - FAILED: {u}")
 
-                page = context.new_page()
-
-            page.set_default_timeout(
-                5000
-            )
-
-            # ------------------------------------------------
-            # Capture
-            # ------------------------------------------------
-
-            capture_highlight(
-                page,
-                url,
-                output_dir,
-            )
+            ok(f"Total files saved   : {total_saved}")
+            if total_renamed:
+                ok(f"Formats auto-fixed  : {total_renamed}")
+            if total_unresolved:
+                warn(f"Unrecognized format : {total_unresolved} (check these manually)")
+            log(f"Output folder       : {OUTPUT_DIR}")
 
             print()
-
-            input(
-                "Press ENTER to close the browser..."
-            )
+            ok("Everything is finished.")
+            input("Press ENTER to close the browser...")
 
         except KeyboardInterrupt:
-
             print()
-
-            warn(
-                "Stopped by user."
-            )
-
-        except Exception as exc:
-
-            print()
-
-            error(
-                f"Fatal error: {exc}"
-            )
-
-            try:
-
-                save_debug(
-                    page,
-                    output_dir,
-                )
-
-            except Exception:
-                pass
-
-            raise
+            warn("Stopped by user.")
 
         finally:
-
             context.close()
 
 

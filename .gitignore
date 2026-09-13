@@ -1,7 +1,16 @@
-@"
-.venv/
+# Python
 __pycache__/
-browser/profile/
-output/
 *.pyc
-"@ | Out-File -Encoding utf8 .gitignore
+.venv/
+venv/
+
+# This project's runtime data -- machine-specific, can get large
+browser/
+output/
+downloads/
+
+# Editor / OS junk
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
