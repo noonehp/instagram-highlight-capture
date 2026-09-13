@@ -305,8 +305,8 @@ def wait_for_new_media(
         if time.time() - last_report > 15:
             last_report = time.time()
             counts = count_all_files_per_dir()
-            summary = ", ".join(f"{d} ({n} files)" for d, n in counts.items())
-            log(f"Waiting for downloaded media... watching: {summary}")
+            summary = ", ".join(f"{d} ({n} total files present)" for d, n in counts.items())
+            log(f"Still waiting ({len(latest)} confirmed for this URL so far) -- {summary}")
 
         time.sleep(1.5)
 
@@ -404,7 +404,23 @@ def move_downloaded_files(
 # OUTPUT FOLDER NAMING
 # ============================================================
 
-def slug_for_url(url: str, index: int) -> str:
+def sanitize_folder_name(name: str) -> str:
+    """Turn a user-supplied label (from #Label or -fn) into a safe
+    Windows/macOS/Linux folder name."""
+    name = name.strip().lstrip("#").strip()
+    # Strip characters that are illegal in Windows folder names.
+    name = re.sub(r'[<>:"/\\|?*]', "_", name)
+    name = re.sub(r"\s+", "_", name)
+    return name.strip("_.")
+
+
+def slug_for_url(url: str, index: int, custom_name: Optional[str] = None) -> str:
+    if custom_name:
+        cleaned = sanitize_folder_name(custom_name)
+        if cleaned:
+            return cleaned
+        warn(f"Ignoring empty/invalid custom folder name for URL {index}; using the default instead.")
+
     match = re.search(r"/highlights/(\d+)", url)
     if match:
         return f"highlight_{match.group(1)}"
@@ -463,10 +479,13 @@ def is_instagram_url(value: str) -> bool:
 def load_urls(
     direct_urls: list[str],
     highlight_url: Optional[str],
+    folder_name: Optional[str],
     input_file: Optional[str],
-) -> list[str]:
+) -> list[tuple[str, Optional[str]]]:
+    """Returns a list of (url, custom_folder_name_or_None), in order,
+    with duplicate URLs removed (first occurrence wins)."""
 
-    urls: list[str] = []
+    entries: list[tuple[str, Optional[str]]] = []
 
     all_direct = list(direct_urls)
     if highlight_url:
@@ -479,7 +498,7 @@ def load_urls(
         if not is_instagram_url(url):
             warn(f"Skipping invalid Instagram URL: {url}")
             continue
-        urls.append(url)
+        entries.append((url, folder_name))
 
     if input_file:
         path = Path(input_file)
@@ -493,20 +512,29 @@ def load_urls(
             line = raw.strip()
             if not line or line.startswith("#"):
                 continue
-            if not is_instagram_url(line):
+
+            # Support "URL #Label" -- everything after the first '#'
+            # (not counting a leading one, handled above) becomes the
+            # output folder name for that URL.
+            url_part, sep, label_part = line.partition("#")
+            url_part = url_part.strip()
+            label = label_part.strip() if sep else None
+
+            if not is_instagram_url(url_part):
                 warn(f"Skipping invalid URL in {path.name} line {line_number}: {line}")
                 continue
-            urls.append(line)
+
+            entries.append((url_part, label))
 
     seen = set()
-    unique_urls = []
-    for url in urls:
+    unique_entries: list[tuple[str, Optional[str]]] = []
+    for url, name in entries:
         if url in seen:
             continue
         seen.add(url)
-        unique_urls.append(url)
+        unique_entries.append((url, name))
 
-    return unique_urls
+    return unique_entries
 
 
 def parse_args() -> argparse.Namespace:
@@ -533,6 +561,29 @@ def parse_args() -> argparse.Namespace:
         dest="input_file",
         metavar="FILE",
         help="Text file containing one Instagram URL per line",
+    )
+
+    parser.add_argument(
+        "-fn", "--folder-name",
+        dest="folder_name",
+        metavar="NAME",
+        help=(
+            "Custom output folder name for the URL(s) given directly on "
+            "the command line (positionally or via -h). Not needed for "
+            "-i files -- use 'URL #Label' per line there instead."
+        ),
+    )
+
+    parser.add_argument(
+        "-r", "--retries",
+        dest="retries",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "How many extra attempts to make for URLs that fail on the "
+            "first pass (default: 1). Set to 0 to disable retries."
+        ),
     )
 
     parser.add_argument(
@@ -648,15 +699,16 @@ def click_turbo_for_url(page: Page) -> str:
 # ONE URL
 # ============================================================
 
-def process_url(page: Page, url: str, index: int, total: int) -> dict:
+def process_url(page: Page, url: str, custom_name: Optional[str], index: int, total: int) -> dict:
     section(f"URL {index}/{total}")
     print(url)
 
-    dest_dir = OUTPUT_DIR / slug_for_url(url, index)
+    dest_dir = OUTPUT_DIR / slug_for_url(url, index, custom_name)
     log(f"Output folder: {dest_dir}")
 
     result = {
         "url": url,
+        "custom_name": custom_name,
         "success": False,
         "saved": 0,
         "renamed": 0,
@@ -721,10 +773,14 @@ def process_url(page: Page, url: str, index: int, total: int) -> dict:
 # MAIN
 # ============================================================
 
+RETRY_COOLDOWN = 10.0  # extra wait before a retry round, in case of rate-limiting
+WARMUP_WAIT = 3.0      # let the extension settle right after Chromium starts
+
+
 def main() -> None:
     args = parse_args()
 
-    urls = load_urls(args.urls, args.highlight_url, args.input_file)
+    urls = load_urls(args.urls, args.highlight_url, args.folder_name, args.input_file)
 
     if not urls:
         error("No Instagram URLs were supplied.")
@@ -732,8 +788,10 @@ def main() -> None:
         print("Examples:")
         print('  python capture.py "https://www.instagram.com/stories/highlights/123/"')
         print('  python capture.py -h "https://www.instagram.com/stories/highlights/123/"')
+        print('  python capture.py "https://www.instagram.com/stories/highlights/123/" -fn MyLabel')
         print('  python capture.py "https://www.instagram.com/stories/highlights/123/" -i inp.txt')
         print("  python capture.py -i inp.txt")
+        print('  python capture.py -i inp.txt -r 3   # retry failures up to 3 extra times')
         sys.exit(1)
 
     extension_path = find_turbo_extension()
@@ -748,6 +806,7 @@ def main() -> None:
 
     banner("Instagram Highlight Downloader")
     log(f"URLs to process : {len(urls)}")
+    log(f"Retries on fail : {args.retries}")
     log(f"Profile         : {PROFILE_DIR}")
     log(f"Output folder   : {OUTPUT_DIR}")
     log(f"Turbo extension : {extension_path}")
@@ -772,27 +831,69 @@ def main() -> None:
             page = context.pages[0] if context.pages else context.new_page()
             page.set_default_timeout(10000)
 
-            results = []
+            log("Letting the extension settle before the first URL...")
+            time.sleep(WARMUP_WAIT)
 
-            for index, url in enumerate(urls, start=1):
-                results.append(process_url(page, url, index, len(urls)))
+            # ---- Pass 1: process every URL once ----
+            results: dict[str, dict] = {}
+            for index, (url, custom_name) in enumerate(urls, start=1):
+                r = process_url(page, url, custom_name, index, len(urls))
+                r["attempts"] = 1
+                results[url] = r
 
                 if index < len(urls):
                     time.sleep(BETWEEN_URLS_WAIT)
 
-            successful_urls = sum(1 for r in results if r["success"])
-            total_saved = sum(r["saved"] for r in results)
-            total_renamed = sum(r["renamed"] for r in results)
-            total_unresolved = sum(r["unresolved"] for r in results)
-            failed_urls = [r["url"] for r in results if not r["success"]]
+            # ---- Retry rounds for whatever failed ----
+            retry_round = 0
+            while retry_round < args.retries:
+                failed_urls = [u for u, r in results.items() if not r["success"]]
+                if not failed_urls:
+                    break
+
+                retry_round += 1
+                banner(f"RETRY ROUND {retry_round}/{args.retries} -- {len(failed_urls)} URL(s) to redo")
+                log(f"Cooling down for {RETRY_COOLDOWN:.0f}s first, in case this was rate-limiting...")
+                time.sleep(RETRY_COOLDOWN)
+
+                for index, u in enumerate(failed_urls, start=1):
+                    custom_name = results[u]["custom_name"]
+                    r = process_url(page, u, custom_name, index, len(failed_urls))
+                    r["attempts"] = results[u]["attempts"] + 1
+                    results[u] = r
+
+                    if index < len(failed_urls):
+                        time.sleep(BETWEEN_URLS_WAIT)
+
+            ordered_results = [results[url] for url, _ in urls]
+
+            successful_urls = sum(1 for r in ordered_results if r["success"])
+            total_saved = sum(r["saved"] for r in ordered_results)
+            total_renamed = sum(r["renamed"] for r in ordered_results)
+            total_unresolved = sum(r["unresolved"] for r in ordered_results)
+            recovered = [r for r in ordered_results if r["success"] and r["attempts"] > 1]
+            still_failed = [r for r in ordered_results if not r["success"]]
 
             banner("ALL DONE")
             if successful_urls == len(urls):
                 ok(f"URLs completed      : {successful_urls}/{len(urls)}  (all of them)")
             else:
                 warn(f"URLs completed      : {successful_urls}/{len(urls)}")
-                for u in failed_urls:
-                    warn(f"  - FAILED: {u}")
+
+            if recovered:
+                ok(f"Recovered on retry  : {len(recovered)}")
+                for r in recovered:
+                    ok(f"  - {r['url']}  (succeeded on attempt {r['attempts']})")
+
+            if still_failed:
+                warn(f"Still failing       : {len(still_failed)} (after {args.retries + 1} attempt(s) each)")
+                for r in still_failed:
+                    warn(f"  - FAILED: {r['url']}")
+                warn(
+                    "These may need a manual look (open the URL yourself and "
+                    "check Turbo works on it) -- could be a highlight-specific "
+                    "issue rather than something retries can fix."
+                )
 
             ok(f"Total files saved   : {total_saved}")
             if total_renamed:
